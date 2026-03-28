@@ -3,6 +3,7 @@ package main
 
 import (
 	"os"
+	"sort"
 	"time"
 )
 
@@ -23,15 +24,20 @@ func handleWatch(msg map[string]interface{}) {
 
 	agentName := "Agent"
 
-	// Emit historical messages
+	// Emit historical messages from SQLite + JSONL session files.
 	history, err := readMessages(sourceDir, group.JID, lines)
 	if err != nil {
 		writeError("DB_ERROR", err.Error())
 		return
 	}
 
+	jsonlPath := findLatestSessionFile(sourceDir, group.Folder)
+	sessionMsgs, sessionOffset := readSessionAssistantMessages(jsonlPath, lines)
+
+	merged := mergeByTimestamp(history, sessionMsgs, lines)
+
 	lastTS := ""
-	for _, m := range history {
+	for _, m := range merged {
 		emitMessage(m, agentName)
 		lastTS = m.Timestamp
 	}
@@ -57,16 +63,50 @@ func handleWatch(msg map[string]interface{}) {
 		case <-done:
 			return
 		case <-ticker.C:
+			// Poll SQLite for new user messages.
 			msgs, err := readNewMessages(sourceDir, group.JID, lastTS)
-			if err != nil {
-				continue
+			if err == nil {
+				for _, m := range msgs {
+					emitMessage(m, agentName)
+					lastTS = m.Timestamp
+				}
 			}
-			for _, m := range msgs {
-				emitMessage(m, agentName)
-				lastTS = m.Timestamp
+
+			// Poll JSONL for new agent messages.
+			currentPath := findLatestSessionFile(sourceDir, group.Folder)
+			if currentPath != jsonlPath {
+				jsonlPath = currentPath
+				sessionOffset = 0
+			}
+			if jsonlPath != "" {
+				newMsgs, newOffset := readNewSessionMessages(jsonlPath, sessionOffset)
+				for _, m := range newMsgs {
+					emitMessage(m, agentName)
+					if m.Timestamp > lastTS {
+						lastTS = m.Timestamp
+					}
+				}
+				sessionOffset = newOffset
 			}
 		}
 	}
+}
+
+// mergeByTimestamp merges two sorted message slices by timestamp and returns
+// the last N entries.
+func mergeByTimestamp(a, b []MessageRow, limit int) []MessageRow {
+	merged := make([]MessageRow, 0, len(a)+len(b))
+	merged = append(merged, a...)
+	merged = append(merged, b...)
+
+	sort.SliceStable(merged, func(i, j int) bool {
+		return merged[i].Timestamp < merged[j].Timestamp
+	})
+
+	if limit > 0 && len(merged) > limit {
+		merged = merged[len(merged)-limit:]
+	}
+	return merged
 }
 
 func emitMessage(m MessageRow, agentName string) {
